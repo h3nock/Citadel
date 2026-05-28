@@ -93,6 +93,12 @@ final class Citadel2Tests: XCTestCase {
         
         final class TestData: @unchecked /* for testing */ Sendable {
             var allDataSent = ByteBuffer()
+            var writeOffsets = [UInt64]()
+
+            func reset() {
+                allDataSent = ByteBuffer()
+                writeOffsets.removeAll()
+            }
         }
         
         struct TestError: Error { }
@@ -117,6 +123,7 @@ final class Citadel2Tests: XCTestCase {
             }
             
             func write(_ data: ByteBuffer, atOffset offset: UInt64) async throws -> SFTPStatusCode {
+                testData.writeOffsets.append(offset)
                 testData.allDataSent.writeImmutableBuffer(data)
                 return .ok
             }
@@ -232,6 +239,18 @@ final class Citadel2Tests: XCTestCase {
                 return XCTFail()
             }
         }
+
+        testData.reset()
+
+        let pipelinedFile = try await sftp.openFile(filePath: "/pipelined", flags: [.create, .write])
+        var pipelinedData = ByteBuffer(string: "prefix-abcdefghijklmnopqrstuvwxyz")
+        XCTAssertEqual(pipelinedData.readString(length: 7), "prefix-")
+
+        try await pipelinedFile.writePipelined(pipelinedData, maxInFlight: 2)
+        try await pipelinedFile.close()
+
+        XCTAssertEqual(testData.writeOffsets, [0])
+        XCTAssertEqual(testData.allDataSent.readBytes(length: 26), Array("abcdefghijklmnopqrstuvwxyz".utf8))
         
         try await client.close()
         try await server.close()

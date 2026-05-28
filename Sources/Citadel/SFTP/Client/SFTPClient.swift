@@ -85,23 +85,33 @@ public final class SFTPClient: Sendable {
     ///   ID is in flight at any given time; multiple reponses to the same ID are likely to cause
     ///   unpredictable behavior.
     internal func sendRequest(_ request: SFTPRequest) async throws -> SFTPResponse {
-        try await self.eventLoop.flatSubmit {
+        try await self.sendRequestFuture(request).get()
+    }
+
+    internal func sendRequestFuture(_ request: SFTPRequest) -> EventLoopFuture<SFTPResponse> {
+        self.eventLoop.flatSubmit {
             let requestId = request.requestId
             let promise = self.channel.eventLoop.makePromise(of: SFTPResponse.self)
-            
+
             // In release builds, silently accept overlapping request IDs, since it can accidentally work correctly.
             assert(self.responses.responses[requestId] == nil, "Attempt to send request with request ID \(requestId) already in flight.")
 
             let message = request.makeMessage()
-            
+
             self.logger.trace("SFTP OUT: \(message.debugDescription)")
             //logger.trace("SFTP OUT: \(message.debugRawBytesRepresentation)")
 
-            self.responses.responses[requestId] = promise
-            return self.channel.writeAndFlush(request.makeMessage()).flatMap {
+            self.responses.register(promise, forRequestId: requestId)
+
+            let writeFuture = self.channel.writeAndFlush(message)
+            writeFuture.whenFailure { error in
+                self.responses.removeResponse(forRequestId: requestId)?.fail(error)
+            }
+
+            return writeFuture.flatMap {
                 promise.futureResult
             }
-        }.get()
+        }
     }
 
     /// Set the attributes of a file on the SFTP server.
@@ -591,6 +601,18 @@ final class SFTPResponses: Sendable {
     var responses: [UInt32: EventLoopPromise<SFTPResponse>] {
         get { _responses.withLockedValue { $0 } }
         set { _responses.withLockedValue { $0 = newValue } }
+    }
+
+    func register(_ promise: EventLoopPromise<SFTPResponse>, forRequestId requestId: UInt32) {
+        _responses.withLockedValue { responses in
+            responses[requestId] = promise
+        }
+    }
+
+    func removeResponse(forRequestId requestId: UInt32) -> EventLoopPromise<SFTPResponse>? {
+        _responses.withLockedValue { responses in
+            responses.removeValue(forKey: requestId)
+        }
     }
     
     init(sftpVersion: EventLoopPromise<SFTPMessage.Version>) {

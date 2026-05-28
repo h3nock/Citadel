@@ -250,6 +250,89 @@ public final class SFTPFile {
         self.logger.debug("SFTP finished writing \(data.readerIndex) bytes @ \(offset) to file \(self.handle.sftpHandleDebugDescription)")
     }
 
+    /// Write data to the file while allowing multiple SFTP write requests to be in flight.
+    ///
+    /// This preserves byte order by sending each chunk with an explicit file offset, while avoiding
+    /// a round trip after every chunk. If any submitted write fails, the method waits for the other
+    /// already-submitted writes to settle before throwing the first error.
+    ///
+    /// - Parameters:
+    ///   - data: ByteBuffer containing the readable bytes to write
+    ///   - offset: Position in file to start writing (defaults to 0)
+    ///   - maxInFlight: Maximum number of write requests to keep in flight
+    /// - Throws: SFTPError if the file handle is invalid, the in-flight limit is invalid, or a write fails
+    public func writePipelined(
+        _ data: ByteBuffer,
+        at offset: UInt64 = 0,
+        maxInFlight: Int = 64
+    ) async throws -> Void {
+        guard self.isActive else { throw SFTPError.fileHandleInvalid }
+        guard maxInFlight > 0 else { throw SFTPError.invalidResponse }
+
+        var data = data
+        let sliceLength = 32_000 // https://github.com/apple/swift-nio-ssh/issues/99
+        var pending = [EventLoopFuture<SFTPResponse>]()
+        pending.reserveCapacity(maxInFlight)
+        var submittedBytes = 0
+        var firstError: Error?
+
+        func validate(_ response: SFTPResponse) throws {
+            guard case .status(let status) = response else {
+                throw SFTPError.invalidResponse
+            }
+
+            guard status.errorCode == .ok else {
+                throw SFTPError.errorStatus(status)
+            }
+        }
+
+        func normalize(_ error: Error) -> Error {
+            if let status = error as? SFTPMessage.Status {
+                return SFTPError.errorStatus(status)
+            }
+
+            return error
+        }
+
+        func awaitWrite(_ future: EventLoopFuture<SFTPResponse>) async -> Error? {
+            do {
+                try validate(try await future.get())
+                return nil
+            } catch {
+                return normalize(error)
+            }
+        }
+
+        while firstError == nil,
+              data.readableBytes > 0,
+              let slice = data.readSlice(length: Swift.min(sliceLength, data.readableBytes)) {
+            let writeOffset = offset + UInt64(submittedBytes)
+            submittedBytes += slice.readableBytes
+            pending.append(self.client.sendRequestFuture(.write(.init(
+                requestId: self.client.allocateRequestId(),
+                handle: self.handle,
+                offset: writeOffset,
+                data: slice
+            ))))
+
+            if pending.count >= maxInFlight {
+                firstError = await awaitWrite(pending.removeFirst())
+            }
+        }
+
+        for future in pending {
+            if let error = await awaitWrite(future), firstError == nil {
+                firstError = error
+            }
+        }
+
+        if let firstError {
+            throw firstError
+        }
+
+        self.logger.debug("SFTP finished pipelined writing \(submittedBytes) bytes @ \(offset) to file \(self.handle.sftpHandleDebugDescription)")
+    }
+
     /// Close the file handle.
     ///
     /// - Throws: SFTPError if close fails
