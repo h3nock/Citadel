@@ -136,6 +136,15 @@ final class KeyTests: XCTestCase {
         let privateKey2 = try Curve25519.Signing.PrivateKey(sshEd25519: key2)
         XCTAssertEqual(privateKey.rawRepresentation, privateKey2.rawRepresentation)
     }
+
+    func testGeneratedED25519PrivateKeyWithFullBlockPadding() throws {
+        let privateKey = Curve25519.Signing.PrivateKey()
+        let key = privateKey.makeSSHRepresentation(comment: "12345")
+
+        let parsed = try Curve25519.Signing.PrivateKey(sshEd25519: key)
+
+        XCTAssertEqual(privateKey.rawRepresentation, parsed.rawRepresentation)
+    }
     
     func testSSHKeyTypeDetection() throws {
         // Test RSA public key detection

@@ -391,10 +391,7 @@ extension OpenSSH.PrivateKey {
         
         let paddingLength = privateKeyBuffer.readableBytes
         
-        guard
-            paddingLength < cipher.blockSize,
-            let padding = privateKeyBuffer.readBytes(length: paddingLength)
-        else {
+        guard paddingLength <= cipher.blockSize else {
             throw InvalidOpenSSHKey.invalidPadding
         }
         
@@ -402,7 +399,11 @@ extension OpenSSH.PrivateKey {
             return
         }
         
-        for i in 1..<paddingLength {
+        guard let padding = privateKeyBuffer.readBytes(length: paddingLength) else {
+            throw InvalidOpenSSHKey.invalidPadding
+        }
+
+        for i in 1...paddingLength {
             guard padding[i - 1] == UInt8(i) else {
                 throw InvalidOpenSSHKey.invalidPadding
             }
