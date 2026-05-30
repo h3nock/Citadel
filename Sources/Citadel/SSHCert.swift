@@ -120,4 +120,101 @@ extension Insecure.RSA.PrivateKey: OpenSSHPrivateKey {
         
         self.init(privateExponent: privateExponent, publicExponent: publicExponent, modulus: modulus)
     }
+
+    func isValidPublicKey(_ publicKey: Insecure.RSA.PublicKey) -> Bool {
+        _publicKey.rawRepresentation == publicKey.rawRepresentation
+    }
+}
+
+extension P256.Signing.PrivateKey: OpenSSHPrivateKey {
+    typealias PublicKey = P256.Signing.PublicKey
+
+    static var publicKeyPrefix: String { "ecdsa-sha2-nistp256" }
+    static var privateKeyPrefix: String { "ecdsa-sha2-nistp256" }
+    static var keyType: OpenSSH.KeyType { .ecdsaP256 }
+
+    /// Creates a new P-256 private key from an OpenSSH private key string.
+    /// - Parameters:
+    ///  - data: The OpenSSH private key data.
+    /// - decryptionKey: The key to decrypt the private key with, if any.
+    public init(sshEcdsaP256 data: Data, decryptionKey: Data? = nil) throws {
+        if let string = String(data: data, encoding: .utf8) {
+            try self.init(sshEcdsaP256: string, decryptionKey: decryptionKey)
+        } else {
+            throw InvalidOpenSSHKey.invalidUTF8String
+        }
+    }
+
+    /// Creates a new P-256 private key from an OpenSSH private key string.
+    /// - Parameters:
+    ///  - key: The OpenSSH private key string.
+    /// - decryptionKey: The key to decrypt the private key with, if any.
+    public init(sshEcdsaP256 key: String, decryptionKey: Data? = nil) throws {
+        self = try OpenSSH.PrivateKey<P256.Signing.PrivateKey>(
+            string: key,
+            decryptionKey: decryptionKey
+        ).privateKey
+    }
+}
+
+extension P384.Signing.PrivateKey: OpenSSHPrivateKey {
+    typealias PublicKey = P384.Signing.PublicKey
+
+    static var publicKeyPrefix: String { "ecdsa-sha2-nistp384" }
+    static var privateKeyPrefix: String { "ecdsa-sha2-nistp384" }
+    static var keyType: OpenSSH.KeyType { .ecdsaP384 }
+
+    /// Creates a new P-384 private key from an OpenSSH private key string.
+    /// - Parameters:
+    ///  - data: The OpenSSH private key data.
+    /// - decryptionKey: The key to decrypt the private key with, if any.
+    public init(sshEcdsaP384 data: Data, decryptionKey: Data? = nil) throws {
+        if let string = String(data: data, encoding: .utf8) {
+            try self.init(sshEcdsaP384: string, decryptionKey: decryptionKey)
+        } else {
+            throw InvalidOpenSSHKey.invalidUTF8String
+        }
+    }
+
+    /// Creates a new P-384 private key from an OpenSSH private key string.
+    /// - Parameters:
+    ///  - key: The OpenSSH private key string.
+    /// - decryptionKey: The key to decrypt the private key with, if any.
+    public init(sshEcdsaP384 key: String, decryptionKey: Data? = nil) throws {
+        self = try OpenSSH.PrivateKey<P384.Signing.PrivateKey>(
+            string: key,
+            decryptionKey: decryptionKey
+        ).privateKey
+    }
+}
+
+extension P521.Signing.PrivateKey: OpenSSHPrivateKey {
+    typealias PublicKey = P521.Signing.PublicKey
+
+    static var publicKeyPrefix: String { "ecdsa-sha2-nistp521" }
+    static var privateKeyPrefix: String { "ecdsa-sha2-nistp521" }
+    static var keyType: OpenSSH.KeyType { .ecdsaP521 }
+
+    /// Creates a new P-521 private key from an OpenSSH private key string.
+    /// - Parameters:
+    ///  - data: The OpenSSH private key data.
+    /// - decryptionKey: The key to decrypt the private key with, if any.
+    public init(sshEcdsaP521 data: Data, decryptionKey: Data? = nil) throws {
+        if let string = String(data: data, encoding: .utf8) {
+            try self.init(sshEcdsaP521: string, decryptionKey: decryptionKey)
+        } else {
+            throw InvalidOpenSSHKey.invalidUTF8String
+        }
+    }
+
+    /// Creates a new P-521 private key from an OpenSSH private key string.
+    /// - Parameters:
+    ///  - key: The OpenSSH private key string.
+    /// - decryptionKey: The key to decrypt the private key with, if any.
+    public init(sshEcdsaP521 key: String, decryptionKey: Data? = nil) throws {
+        self = try OpenSSH.PrivateKey<P521.Signing.PrivateKey>(
+            string: key,
+            decryptionKey: decryptionKey
+        ).privateKey
+    }
 }
