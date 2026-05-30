@@ -68,6 +68,18 @@ final class KeyTests: XCTestCase {
         
         let privateKey = try Insecure.RSA.PrivateKey(sshRsa: key)
         XCTAssertNotNil(privateKey)
+        let message = Data("rsa-sha2 signing test".utf8)
+        let publicKey = try XCTUnwrap(privateKey.publicKey as? Insecure.RSA.PublicKey)
+
+        let legacySignature: Insecure.RSA.Signature = try privateKey.signature(for: message)
+        XCTAssertEqual(type(of: legacySignature).signaturePrefix, "ssh-rsa")
+        XCTAssertTrue(publicKey.isValidSignature(legacySignature, for: message))
+
+        let rsaSHA2Signature = try XCTUnwrap(
+            try privateKey.signature(for: message, algorithm: "rsa-sha2-512") as? Insecure.RSA.SHA512Signature
+        )
+        XCTAssertEqual(type(of: rsaSHA2Signature).signaturePrefix, "rsa-sha2-512")
+        XCTAssertTrue(publicKey.isValidSignature(rsaSHA2Signature, for: message))
         
         let openSSHPrivateKey = try Insecure.RSA.PrivateKey(sshRsa: key)
         XCTAssertNotNil(openSSHPrivateKey)
