@@ -97,28 +97,29 @@ public final class SFTPClient: Sendable {
         eventLoop: EventLoop,
         logger: Logger
     ) -> EventLoopFuture<SFTPClient> {
+        let result = eventLoop.makePromise(of: SFTPClient.self)
         let createChannel = eventLoop.makePromise(of: Channel.self)
         let createClient = eventLoop.makePromise(of: SFTPClient.self)
-        let timeoutCheck = eventLoop.makePromise(of: Void.self)
+        let openTimeout: TimeAmount = .seconds(15)
 
         sshHandler.createChannel(createChannel) { channel, _ in
-            SFTPClient.setupChannelHanders(channel: channel, logger: logger)
+            result.futureResult.whenFailure { _ in
+                channel.close(promise: nil)
+            }
+            return SFTPClient.setupChannelHanders(channel: channel, logger: logger)
                 .map { client in
                     createClient.succeed(client)
                 }
         }
 
-        timeoutCheck.futureResult.whenFailure { _ in
+        let timeout = eventLoop.scheduleTask(in: openTimeout) {
             logger.warning("SFTP subsystem request or initialize message received no reply after 15 seconds. Likely the result of opening too many SFTPClient handles.")
-        }
-
-        eventLoop.scheduleTask(in: .seconds(15)) {
-            timeoutCheck.fail(SFTPError.missingResponse)
             createChannel.fail(SFTPError.missingResponse)
             createClient.fail(SFTPError.missingResponse)
+            result.fail(SFTPError.missingResponse)
         }
 
-        return createChannel.futureResult.flatMap { channel in
+        let open = createChannel.futureResult.flatMap { channel in
             let openSubsystem = eventLoop.makePromise(of: Void.self)
 
             logger.debug("SFTP requesting subsystem")
@@ -130,31 +131,43 @@ public final class SFTPClient: Sendable {
                 ),
                 promise: openSubsystem
             )
-            return openSubsystem.futureResult
-        }.flatMap {
-            logger.debug("SFTP subsystem request completed")
-            return createClient.futureResult
-        }.flatMap { (client: SFTPClient) in
-            timeoutCheck.succeed(())
 
-            let initializeMessage = SFTPMessage.initialize(.init(version: .v3))
+            let initialized = openSubsystem.futureResult.flatMap {
+                logger.debug("SFTP subsystem request completed")
+                return createClient.futureResult
+            }.flatMap { (client: SFTPClient) in
+                let initializeMessage = SFTPMessage.initialize(.init(version: .v3))
 
-            logger.debug("SFTP start with version \(SFTPProtocolVersion.v3)")
-            logger.trace("SFTP OUT: \(initializeMessage.debugDescription)")
-            //logger.trace("SFTP OUT: \(initializeMessage.debugRawBytesRepresentation)")
+                logger.debug("SFTP start with version \(SFTPProtocolVersion.v3)")
+                logger.trace("SFTP OUT: \(initializeMessage.debugDescription)")
+                //logger.trace("SFTP OUT: \(initializeMessage.debugRawBytesRepresentation)")
 
-            return client.channel.writeAndFlush(initializeMessage).flatMap {
-                return client.responses.sftpVersion.futureResult
-            }.flatMapThrowing { serverVersion in
-                guard serverVersion.version >= .v3 else {
-                    logger.warning("SFTP ERROR: Server version is unrecognized: \(serverVersion.version.rawValue)")
-                    throw SFTPError.unsupportedVersion(serverVersion.version)
+                return client.channel.writeAndFlush(initializeMessage).flatMap {
+                    return client.responses.sftpVersion.futureResult
+                }.flatMapThrowing { serverVersion in
+                    guard serverVersion.version >= .v3 else {
+                        logger.warning("SFTP ERROR: Server version is unrecognized: \(serverVersion.version.rawValue)")
+                        throw SFTPError.unsupportedVersion(serverVersion.version)
+                    }
+
+                    logger.info("SFTP connection opened and ready")
+                    return client
                 }
+            }
 
-                logger.info("SFTP connection opened and ready")
-                return client
+            return initialized.flatMapError { error in
+                channel.close().flatMapThrowing {
+                    throw error
+                }
             }
         }
+
+        open.whenComplete { openResult in
+            timeout.cancel()
+            result.completeWith(openResult)
+        }
+
+        return result.futureResult
     }
     
     /// Returns a unique request ID for use in an SFTP message. Does _not_ register the ID for
