@@ -201,6 +201,68 @@ final class EndToEndTests: XCTestCase {
         )
     }
 
+    func testOpenSFTPOverAuthenticatedSSHChannel() async throws {
+        final class SFTP: SFTPDelegate, @unchecked /* for testing */ Sendable {
+            var didCreateDirectory = false
+
+            func createDirectory(_ filePath: String, withAttributes: SFTPFileAttributes, context: SSHContext) async throws -> SFTPStatusCode {
+                XCTAssertEqual(context.username, "citadel")
+                XCTAssertEqual(filePath, "/test/citadel/shared-root-sftp")
+                didCreateDirectory = true
+                return .ok
+            }
+        }
+
+        try await runTest(
+            perform: { server, client in
+                let sftpServer = SFTP()
+                server.enableSFTP(withDelegate: sftpServer)
+                let sftp = try await SFTPClient.open(overAuthenticatedSSHChannel: client.session.channel)
+                try await sftp.createDirectory(atPath: "/test/citadel/shared-root-sftp")
+                try await sftp.close()
+
+                XCTAssertTrue(sftpServer.didCreateDirectory)
+                XCTAssertTrue(client.isConnected)
+            },
+            matchingError: { _ in false },
+            expectsFailure: false
+        )
+    }
+
+    func testOpenSFTPFailureKeepsAuthenticatedSSHChannelUsable() async throws {
+        final class SFTP: SFTPDelegate, @unchecked /* for testing */ Sendable {
+            var didCreateDirectory = false
+
+            func createDirectory(_ filePath: String, withAttributes: SFTPFileAttributes, context: SSHContext) async throws -> SFTPStatusCode {
+                XCTAssertEqual(filePath, "/test/citadel/shared-root-sftp-after-failure")
+                didCreateDirectory = true
+                return .ok
+            }
+        }
+
+        try await runTest(
+            perform: { server, client in
+                do {
+                    _ = try await SFTPClient.open(overAuthenticatedSSHChannel: client.session.channel)
+                    XCTFail("SFTP open should fail before the server enables SFTP")
+                } catch {
+                    XCTAssertTrue(client.isConnected)
+                }
+
+                let sftpServer = SFTP()
+                server.enableSFTP(withDelegate: sftpServer)
+                let sftp = try await SFTPClient.open(overAuthenticatedSSHChannel: client.session.channel)
+                try await sftp.createDirectory(atPath: "/test/citadel/shared-root-sftp-after-failure")
+                try await sftp.close()
+
+                XCTAssertTrue(sftpServer.didCreateDirectory)
+                XCTAssertTrue(client.isConnected)
+            },
+            matchingError: { _ in false },
+            expectsFailure: false
+        )
+    }
+
     func testSetAttributes() async throws {
         final class SFTP: SFTPDelegate, @unchecked /* for testing */ Sendable {
             var fileAttributes: SFTPFileAttributes?

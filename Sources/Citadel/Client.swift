@@ -102,6 +102,8 @@ public struct SSHAlgorithms: Sendable {
 
         algorithms.publicKeyAlgorihtms = .add([
             (Insecure.RSA.PublicKey.self, Insecure.RSA.Signature.self),
+            (Insecure.RSA.PublicKey.self, Insecure.RSA.SHA256Signature.self),
+            (Insecure.RSA.PublicKey.self, Insecure.RSA.SHA512Signature.self),
         ])
 
         return algorithms
@@ -178,6 +180,11 @@ public final class SSHClient {
             inboundChannelHandler: inboundChannelHandler,
             settings: settings
         ).get()
+        try await channel.setOption(
+            ChannelOptions.autoRead,
+            value: true
+        ).get()
+        channel.read()
         
         let sshHandler = try await channel.pipeline.handler(type: NIOSSHHandler.self).get()
         let handshakeHandler = try await channel.pipeline.handler(type: ClientHandshakeHandler.self).get()

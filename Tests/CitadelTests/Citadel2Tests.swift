@@ -1,4 +1,5 @@
 import Crypto
+import Foundation
 import BigInt
 import NIO
 import XCTest
@@ -93,6 +94,12 @@ final class Citadel2Tests: XCTestCase {
         
         final class TestData: @unchecked /* for testing */ Sendable {
             var allDataSent = ByteBuffer()
+            var writeOffsets = [UInt64]()
+
+            func reset() {
+                allDataSent = ByteBuffer()
+                writeOffsets.removeAll()
+            }
         }
         
         struct TestError: Error { }
@@ -117,6 +124,7 @@ final class Citadel2Tests: XCTestCase {
             }
             
             func write(_ data: ByteBuffer, atOffset offset: UInt64) async throws -> SFTPStatusCode {
+                testData.writeOffsets.append(offset)
                 testData.allDataSent.writeImmutableBuffer(data)
                 return .ok
             }
@@ -232,6 +240,18 @@ final class Citadel2Tests: XCTestCase {
                 return XCTFail()
             }
         }
+
+        testData.reset()
+
+        let pipelinedFile = try await sftp.openFile(filePath: "/pipelined", flags: [.create, .write])
+        var pipelinedData = ByteBuffer(string: "prefix-abcdefghijklmnopqrstuvwxyz")
+        XCTAssertEqual(pipelinedData.readString(length: 7), "prefix-")
+
+        try await pipelinedFile.writePipelined(pipelinedData, maxInFlight: 2)
+        try await pipelinedFile.close()
+
+        XCTAssertEqual(testData.writeOffsets, [0])
+        XCTAssertEqual(testData.allDataSent.readBytes(length: 26), Array("abcdefghijklmnopqrstuvwxyz".utf8))
         
         try await client.close()
         try await server.close()
@@ -277,6 +297,39 @@ final class Citadel2Tests: XCTestCase {
 
         let output = try await client.executeCommand("ls /")
         XCTAssertFalse(String(buffer: output).isEmpty)
+
+        try await client.close()
+    }
+
+    func testConnectToOpenSSHServerWithRSAKey() async throws {
+        guard
+            let host = ProcessInfo.processInfo.environment["SSH_HOST"],
+            let _port = ProcessInfo.processInfo.environment["SSH_PORT"],
+            let port = Int(_port),
+            let username = ProcessInfo.processInfo.environment["SSH_USERNAME"],
+            let keyPath = ProcessInfo.processInfo.environment["SSH_RSA_KEY_PATH"]
+        else {
+            throw XCTSkip("SSH environment variables not set (SSH_HOST, SSH_PORT, SSH_USERNAME, SSH_RSA_KEY_PATH)")
+        }
+
+        let key = try String(contentsOfFile: keyPath, encoding: .utf8)
+        let passphrase = ProcessInfo.processInfo.environment["SSH_RSA_KEY_PASSPHRASE"]
+        let privateKey = try Insecure.RSA.PrivateKey(
+            sshRsa: key,
+            decryptionKey: passphrase?.data(using: .utf8)
+        )
+
+        let client = try await SSHClient.connect(
+            host: host,
+            port: port,
+            authenticationMethod: .rsa(username: username, privateKey: privateKey),
+            hostKeyValidator: .acceptAnything(),
+            reconnect: .never,
+            algorithms: .all
+        )
+
+        let output = try await client.executeCommand("printf remux-rsa-sha2-ok")
+        XCTAssertEqual(String(buffer: output), "remux-rsa-sha2-ok")
 
         try await client.close()
     }

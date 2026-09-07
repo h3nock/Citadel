@@ -54,7 +54,12 @@ extension Insecure.RSA {
             throw CitadelError.unsupported
         }
         
-        public func isValidSignature<D: DataProtocol>(_ signature: Signature, for digest: D) -> Bool {
+        private func isValidSignature<D: DataProtocol, H: HashFunction>(
+            _ signature: some NIOSSHSignatureProtocol,
+            for digest: D,
+            hashFunction: H.Type,
+            boringSSLNID: Int32
+        ) -> Bool {
             let context = CCryptoBoringSSL_RSA_new()
             defer { CCryptoBoringSSL_RSA_free(context) }
 
@@ -73,27 +78,42 @@ extension Insecure.RSA {
                 return false
             }
             
-            var clientSignature = [UInt8](repeating: 0, count: 20)
-            let digest = Array(digest)
-            CCryptoBoringSSL_SHA1(digest, digest.count, &clientSignature)
+            let clientSignature = Array(hashFunction.hash(data: digest))
             
             let signature = Array(signature.rawRepresentation)
             return CCryptoBoringSSL_RSA_verify(
-                NID_sha1,
+                boringSSLNID,
                 clientSignature,
-                20,
+                clientSignature.count,
                 signature,
                 signature.count,
                 context
             ) == 1
         }
+
+        public func isValidSignature<D: DataProtocol>(_ signature: Signature, for digest: D) -> Bool {
+            isValidSignature(signature, for: digest, hashFunction: Insecure.SHA1.self, boringSSLNID: NID_sha1)
+        }
+
+        public func isValidSignature<D: DataProtocol>(_ signature: SHA256Signature, for digest: D) -> Bool {
+            isValidSignature(signature, for: digest, hashFunction: SHA256.self, boringSSLNID: NID_sha256)
+        }
+
+        public func isValidSignature<D: DataProtocol>(_ signature: SHA512Signature, for digest: D) -> Bool {
+            isValidSignature(signature, for: digest, hashFunction: SHA512.self, boringSSLNID: NID_sha512)
+        }
         
         public func isValidSignature<D>(_ signature: NIOSSHSignatureProtocol, for data: D) -> Bool where D : DataProtocol {
-            guard let signature = signature as? Signature else {
-                return false
+            if let signature = signature as? Signature {
+                return isValidSignature(signature, for: data)
             }
-            
-            return isValidSignature(signature, for: data)
+            if let signature = signature as? SHA256Signature {
+                return isValidSignature(signature, for: data)
+            }
+            if let signature = signature as? SHA512Signature {
+                return isValidSignature(signature, for: data)
+            }
+            return false
         }
         
         public func write(to buffer: inout ByteBuffer) -> Int {
@@ -163,8 +183,60 @@ extension Insecure.RSA {
             return Signature(rawRepresentation: buffer.getData(at: 0, length: buffer.readableBytes)!)
         }
     }
+
+    public struct SHA256Signature: ContiguousBytes, NIOSSHSignatureProtocol {
+        public static let signaturePrefix = "rsa-sha2-256"
+
+        public let rawRepresentation: Data
+
+        public init<D>(rawRepresentation: D) where D : DataProtocol {
+            self.rawRepresentation = Data(rawRepresentation)
+        }
+
+        public func withUnsafeBytes<R>(_ body: (UnsafeRawBufferPointer) throws -> R) rethrows -> R {
+            try rawRepresentation.withUnsafeBytes(body)
+        }
+
+        public func write(to buffer: inout ByteBuffer) -> Int {
+            buffer.writeSSHString(rawRepresentation)
+        }
+
+        public static func read(from buffer: inout ByteBuffer) throws -> SHA256Signature {
+            guard let buffer = buffer.readSSHBuffer() else {
+                throw RSAError(message: "Invalid signature format")
+            }
+
+            return SHA256Signature(rawRepresentation: buffer.getData(at: 0, length: buffer.readableBytes)!)
+        }
+    }
+
+    public struct SHA512Signature: ContiguousBytes, NIOSSHSignatureProtocol {
+        public static let signaturePrefix = "rsa-sha2-512"
+
+        public let rawRepresentation: Data
+
+        public init<D>(rawRepresentation: D) where D : DataProtocol {
+            self.rawRepresentation = Data(rawRepresentation)
+        }
+
+        public func withUnsafeBytes<R>(_ body: (UnsafeRawBufferPointer) throws -> R) rethrows -> R {
+            try rawRepresentation.withUnsafeBytes(body)
+        }
+
+        public func write(to buffer: inout ByteBuffer) -> Int {
+            buffer.writeSSHString(rawRepresentation)
+        }
+
+        public static func read(from buffer: inout ByteBuffer) throws -> SHA512Signature {
+            guard let buffer = buffer.readSSHBuffer() else {
+                throw RSAError(message: "Invalid signature format")
+            }
+
+            return SHA512Signature(rawRepresentation: buffer.getData(at: 0, length: buffer.readableBytes)!)
+        }
+    }
     
-    public final class PrivateKey: NIOSSHPrivateKeyProtocol {
+    public final class PrivateKey: NIOSSHAlgorithmSpecificPrivateKeyProtocol {
         public static let keyPrefix = "ssh-rsa"
         
         // Private Exponent
@@ -177,7 +249,11 @@ extension Insecure.RSA {
             _publicKey
         }
         
-        public init(privateExponent: UnsafeMutablePointer<BIGNUM>, publicExponent: UnsafeMutablePointer<BIGNUM>, modulus: UnsafeMutablePointer<BIGNUM>) {
+        public init(
+            privateExponent: UnsafeMutablePointer<BIGNUM>,
+            publicExponent: UnsafeMutablePointer<BIGNUM>,
+            modulus: UnsafeMutablePointer<BIGNUM>
+        ) {
             self.privateExponent = privateExponent
             self._publicKey = PublicKey(publicExponent: publicExponent, modulus: modulus)
         }
@@ -209,15 +285,19 @@ extension Insecure.RSA {
             )
         }
         
-        public func signature<D: DataProtocol>(for message: D) throws -> Signature {
+        private func signatureData<D: DataProtocol, H: HashFunction>(
+            for message: D,
+            hashFunction: H.Type,
+            boringSSLNID: Int32
+        ) throws -> Data {
             let context = CCryptoBoringSSL_RSA_new()
             defer { CCryptoBoringSSL_RSA_free(context) }
 
-            // Copy, so that our local `self.modulus` isn't freed by RSA_free
+            // Copy, so that our local BIGNUMs aren't freed by RSA_free.
             let modulus = CCryptoBoringSSL_BN_new()!
             let publicExponent = CCryptoBoringSSL_BN_new()!
             let privateExponent = CCryptoBoringSSL_BN_new()!
-            
+
             CCryptoBoringSSL_BN_copy(modulus, self._publicKey.modulus)
             CCryptoBoringSSL_BN_copy(publicExponent, self._publicKey.publicExponent)
             CCryptoBoringSSL_BN_copy(privateExponent, self.privateExponent)
@@ -229,25 +309,51 @@ extension Insecure.RSA {
             ) == 1 else {
                 throw CitadelError.signingError
             }
-            
-            let hash = Array(Insecure.SHA1.hash(data: message))
-            let out = UnsafeMutablePointer<UInt8>.allocate(capacity: 4096)
-            defer { out.deallocate() }
-            var outLength: UInt32 = 4096
+
+            let hash = Array(hashFunction.hash(data: message))
+            let outputCapacity = Int(CCryptoBoringSSL_RSA_size(context))
+            let output = UnsafeMutablePointer<UInt8>.allocate(capacity: outputCapacity)
+            defer { output.deallocate() }
+
+            var outputLength = UInt32(outputCapacity)
             let result = CCryptoBoringSSL_RSA_sign(
-                NID_sha1,
+                boringSSLNID,
                 hash,
-                Int(hash.count),
-                out,
-                &outLength,
+                hash.count,
+                output,
+                &outputLength,
                 context
             )
-            
+
             guard result == 1 else {
                 throw CitadelError.signingError
             }
-            
-            return Signature(rawRepresentation: Data(bytes: out, count: Int(outLength)))
+
+            return Data(bytes: output, count: Int(outputLength))
+        }
+
+        public func signature<D: DataProtocol>(for message: D) throws -> Signature {
+            let signature = try signatureData(
+                for: message,
+                hashFunction: Insecure.SHA1.self,
+                boringSSLNID: NID_sha1
+            )
+            return Signature(rawRepresentation: signature)
+        }
+
+        public func signature<D: DataProtocol>(for message: D, algorithm: String) throws -> NIOSSHSignatureProtocol {
+            switch algorithm {
+            case Signature.signaturePrefix:
+                return try signature(for: message) as Signature
+            case SHA256Signature.signaturePrefix:
+                let signature = try signatureData(for: message, hashFunction: SHA256.self, boringSSLNID: NID_sha256)
+                return SHA256Signature(rawRepresentation: signature)
+            case SHA512Signature.signaturePrefix:
+                let signature = try signatureData(for: message, hashFunction: SHA512.self, boringSSLNID: NID_sha512)
+                return SHA512Signature(rawRepresentation: signature)
+            default:
+                throw CitadelError.unsupported
+            }
         }
         
         public func signature<D>(for data: D) throws -> NIOSSHSignatureProtocol where D : DataProtocol {
@@ -255,16 +361,6 @@ extension Insecure.RSA {
         }
         
         public func decrypt(_ message: EncryptedMessage) throws -> Data {
-//            let signature = BigUInt(message.rawRepresentation)
-//
-//            switch storage {
-//            case let .privateExponent(privateExponent, modulus):
-//                guard signature >= .zero && signature <= privateExponent else {
-//                    throw RSAError.ciphertextRepresentativeOutOfRange
-//                }
-//
-//                return signature.power(privateExponent, modulus: modulus).serialize()
-//            }
             throw CitadelError.unsupported
         }
         

@@ -20,6 +20,8 @@ protocol OpenSSHPrivateKey: ByteBufferConvertible {
     static var keyType: OpenSSH.KeyType { get }
     
     associatedtype PublicKey: ByteBufferConvertible
+
+    func isValidPublicKey(_ publicKey: PublicKey) -> Bool
 }
 
 extension Insecure.RSA.PrivateKey: ByteBufferConvertible {
@@ -75,6 +77,10 @@ extension Curve25519.Signing.PrivateKey: ByteBufferConvertible {
         }
         
         return try Self.init(rawRepresentation: privateKeyBytes)
+    }
+
+    func isValidPublicKey(_ publicKey: Curve25519.Signing.PublicKey) -> Bool {
+        self.publicKey.rawRepresentation == publicKey.rawRepresentation
     }
     
     @discardableResult
@@ -136,6 +142,167 @@ extension Curve25519.Signing.PrivateKey: ByteBufferConvertible {
         
         return string
     }
+}
+
+struct OpenSSHECDSAKeyParameters {
+    let curveName: String
+    let scalarByteCount: Int
+}
+
+protocol OpenSSHECDSAPublicKey: ByteBufferConvertible {
+    static var openSSHECDSAParameters: OpenSSHECDSAKeyParameters { get }
+
+    init<D>(x963Representation: D) throws where D: ContiguousBytes
+    var x963Representation: Data { get }
+}
+
+protocol OpenSSHECDSAPrivateKey: OpenSSHPrivateKey where PublicKey: OpenSSHECDSAPublicKey {
+    static var openSSHECDSAParameters: OpenSSHECDSAKeyParameters { get }
+
+    init<D>(rawRepresentation: D) throws where D: ContiguousBytes
+    var rawRepresentation: Data { get }
+    var publicKey: PublicKey { get }
+}
+
+private extension ByteBuffer {
+    mutating func readOpenSSHECDSAPublicPoint(
+        parameters: OpenSSHECDSAKeyParameters
+    ) throws -> [UInt8] {
+        guard readSSHString() == parameters.curveName else {
+            throw InvalidOpenSSHKey.invalidLayout
+        }
+
+        guard var publicKeyBuffer = readSSHBuffer() else {
+            throw InvalidOpenSSHKey.missingPublicKeyBuffer
+        }
+
+        guard let publicKeyBytes = publicKeyBuffer.readBytes(length: publicKeyBuffer.readableBytes) else {
+            throw InvalidOpenSSHKey.missingPublicKeyBuffer
+        }
+
+        return publicKeyBytes
+    }
+
+    mutating func readOpenSSHECDSAPrivateScalar(
+        parameters: OpenSSHECDSAKeyParameters
+    ) throws -> [UInt8] {
+        guard var scalarBuffer = readSSHBuffer() else {
+            throw InvalidOpenSSHKey.missingPrivateKeyBuffer
+        }
+
+        guard var scalarBytes = scalarBuffer.readBytes(length: scalarBuffer.readableBytes), !scalarBytes.isEmpty else {
+            throw InvalidOpenSSHKey.invalidLayout
+        }
+
+        if scalarBytes[0] == 0 {
+            guard scalarBytes.count > 1, scalarBytes[1] & 0x80 != 0 else {
+                throw InvalidOpenSSHKey.invalidLayout
+            }
+            scalarBytes.removeFirst()
+        } else {
+            guard scalarBytes[0] & 0x80 == 0 else {
+                throw InvalidOpenSSHKey.invalidLayout
+            }
+        }
+
+        guard scalarBytes.contains(where: { $0 != 0 }) else {
+            throw InvalidOpenSSHKey.invalidLayout
+        }
+
+        guard scalarBytes.count <= parameters.scalarByteCount else {
+            throw InvalidOpenSSHKey.invalidLayout
+        }
+
+        if scalarBytes.count < parameters.scalarByteCount {
+            scalarBytes = Array(repeating: 0, count: parameters.scalarByteCount - scalarBytes.count) + scalarBytes
+        }
+
+        return scalarBytes
+    }
+}
+
+extension OpenSSHECDSAPublicKey {
+    static func read(consuming buffer: inout ByteBuffer) throws -> Self {
+        let publicKeyBytes = try buffer.readOpenSSHECDSAPublicPoint(parameters: openSSHECDSAParameters)
+        return try Self(x963Representation: publicKeyBytes)
+    }
+
+    @discardableResult
+    func write(to buffer: inout ByteBuffer) -> Int {
+        var writtenBytes = 0
+        writtenBytes += buffer.writeSSHString(Self.openSSHECDSAParameters.curveName.utf8)
+        writtenBytes += buffer.writeSSHString(x963Representation)
+        return writtenBytes
+    }
+}
+
+extension OpenSSHECDSAPrivateKey {
+    static func read(consuming buffer: inout ByteBuffer) throws -> Self {
+        let publicKeyBytes = try buffer.readOpenSSHECDSAPublicPoint(parameters: openSSHECDSAParameters)
+        let scalarBytes = try buffer.readOpenSSHECDSAPrivateScalar(parameters: openSSHECDSAParameters)
+        let privateKey = try Self(rawRepresentation: scalarBytes)
+
+        guard privateKey.publicKey.x963Representation == Data(publicKeyBytes) else {
+            throw InvalidOpenSSHKey.invalidPublicKeyInPrivateKey
+        }
+
+        return privateKey
+    }
+
+    @discardableResult
+    func write(to buffer: inout ByteBuffer) -> Int {
+        var writtenBytes = 0
+        writtenBytes += buffer.writeSSHString(Self.openSSHECDSAParameters.curveName.utf8)
+        writtenBytes += buffer.writeSSHString(publicKey.x963Representation)
+        writtenBytes += buffer.writePositiveMPInt(rawRepresentation)
+        return writtenBytes
+    }
+
+    func isValidPublicKey(_ publicKey: PublicKey) -> Bool {
+        self.publicKey.x963Representation == publicKey.x963Representation
+    }
+}
+
+extension P256.Signing.PublicKey: OpenSSHECDSAPublicKey {
+    static let openSSHECDSAParameters = OpenSSHECDSAKeyParameters(
+        curveName: "nistp256",
+        scalarByteCount: 32
+    )
+}
+
+extension P256.Signing.PrivateKey: OpenSSHECDSAPrivateKey {
+    static let openSSHECDSAParameters = OpenSSHECDSAKeyParameters(
+        curveName: "nistp256",
+        scalarByteCount: 32
+    )
+}
+
+extension P384.Signing.PublicKey: OpenSSHECDSAPublicKey {
+    static let openSSHECDSAParameters = OpenSSHECDSAKeyParameters(
+        curveName: "nistp384",
+        scalarByteCount: 48
+    )
+}
+
+extension P384.Signing.PrivateKey: OpenSSHECDSAPrivateKey {
+    static let openSSHECDSAParameters = OpenSSHECDSAKeyParameters(
+        curveName: "nistp384",
+        scalarByteCount: 48
+    )
+}
+
+extension P521.Signing.PublicKey: OpenSSHECDSAPublicKey {
+    static let openSSHECDSAParameters = OpenSSHECDSAKeyParameters(
+        curveName: "nistp521",
+        scalarByteCount: 66
+    )
+}
+
+extension P521.Signing.PrivateKey: OpenSSHECDSAPrivateKey {
+    static let openSSHECDSAParameters = OpenSSHECDSAKeyParameters(
+        curveName: "nistp521",
+        scalarByteCount: 66
+    )
 }
 
 extension ByteBuffer {
@@ -287,6 +454,9 @@ enum OpenSSH {
     enum KeyType: String {
         case sshRSA = "ssh-rsa"
         case sshED25519 = "ssh-ed25519"
+        case ecdsaP256 = "ecdsa-sha2-nistp256"
+        case ecdsaP384 = "ecdsa-sha2-nistp384"
+        case ecdsaP521 = "ecdsa-sha2-nistp521"
     }
     
     struct PrivateKey<SSHKey: OpenSSHPrivateKey> {
@@ -354,9 +524,15 @@ extension OpenSSH.PrivateKey {
         }
 
         self.publicKey = try SSHKey.PublicKey.read(consuming: &publicKeyBuffer)
+        guard publicKeyBuffer.readableBytes == 0 else {
+            throw InvalidOpenSSHKey.invalidLayout
+        }
         
         guard var privateKeyBuffer = buffer.readSSHBuffer() else {
             throw InvalidOpenSSHKey.missingPrivateKeyBuffer
+        }
+        guard buffer.readableBytes == 0 else {
+            throw InvalidOpenSSHKey.invalidLayout
         }
         
         try kdf.withKeyAndIV(
@@ -383,6 +559,9 @@ extension OpenSSH.PrivateKey {
         }
         
         self.privateKey = try SSHKey.read(consuming: &privateKeyBuffer)
+        guard self.privateKey.isValidPublicKey(publicKey) else {
+            throw InvalidOpenSSHKey.invalidPublicKeyInPrivateKey
+        }
         
         guard let comment = privateKeyBuffer.readSSHString() else {
             throw InvalidOpenSSHKey.missingComment
@@ -391,10 +570,7 @@ extension OpenSSH.PrivateKey {
         
         let paddingLength = privateKeyBuffer.readableBytes
         
-        guard
-            paddingLength < cipher.blockSize,
-            let padding = privateKeyBuffer.readBytes(length: paddingLength)
-        else {
+        guard paddingLength <= cipher.blockSize else {
             throw InvalidOpenSSHKey.invalidPadding
         }
         
@@ -402,7 +578,11 @@ extension OpenSSH.PrivateKey {
             return
         }
         
-        for i in 1..<paddingLength {
+        guard let padding = privateKeyBuffer.readBytes(length: paddingLength) else {
+            throw InvalidOpenSSHKey.invalidPadding
+        }
+
+        for i in 1...paddingLength {
             guard padding[i - 1] == UInt8(i) else {
                 throw InvalidOpenSSHKey.invalidPadding
             }

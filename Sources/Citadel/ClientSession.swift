@@ -182,21 +182,16 @@ final class SSHClientSession: Sendable {
             option.apply(to: &clientConfiguration)
         }
         
-        do {
-            try channel.pipeline.syncOperations.addHandlers(
-                NIOSSHHandler(
-                    role: .client(clientConfiguration),
-                    allocator: channel.allocator,
-                    inboundChildChannelInitializer: { channel, channelType in
-                        return inboundChannelHandler.handleChannel(channel: channel, channelType: channelType)
-                    }
-                ),
-                handshakeHandler
-            )
-            return channel.eventLoop.makeSucceededVoidFuture()
-        } catch {
-            return channel.eventLoop.makeFailedFuture(error)
-        }
+        return channel.pipeline.addHandlers(
+            NIOSSHHandler(
+                role: .client(clientConfiguration),
+                allocator: channel.allocator,
+                inboundChildChannelInitializer: { channel, channelType in
+                    return inboundChannelHandler.handleChannel(channel: channel, channelType: channelType)
+                }
+            ),
+            handshakeHandler
+        )
     }
 
     /// Creates a new SSH session on a new channel. This will connect to the given host and port.

@@ -24,6 +24,18 @@ enum SSHServerError: Error {
 }
 
 final class KeyTests: XCTestCase {
+    private static let ecdsaP256PrivateKey = """
+        -----BEGIN OPENSSH PRIVATE KEY-----
+        b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAaAAAABNlY2RzYS
+        1zaGEyLW5pc3RwMjU2AAAACG5pc3RwMjU2AAAAQQR/G9rJovBSvdkd9XoGNURImI5vQP/2
+        w7TQNb/b8hGI5oq844XjI7V4j8XDwjqlcNfeD7gqoHf8ekpmL4EUtzYaAAAAqFZzBpBWcw
+        aQAAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBH8b2smi8FK92R31
+        egY1REiYjm9A//bDtNA1v9vyEYjmirzjheMjtXiPxcPCOqVw194PuCqgd/x6SmYvgRS3Nh
+        oAAAAgPV1jW6vy45i2F3WBFirMPgiJU7FgIl4rJy264fkhPU4AAAALeW91QGV4YW1wbGUB
+        AgMEBQ==
+        -----END OPENSSH PRIVATE KEY-----
+        """
+
     func testRSAPrivateKey() throws {
         let key = """
             -----BEGIN OPENSSH PRIVATE KEY-----
@@ -68,6 +80,18 @@ final class KeyTests: XCTestCase {
         
         let privateKey = try Insecure.RSA.PrivateKey(sshRsa: key)
         XCTAssertNotNil(privateKey)
+        let message = Data("rsa-sha2 signing test".utf8)
+        let publicKey = try XCTUnwrap(privateKey.publicKey as? Insecure.RSA.PublicKey)
+
+        let legacySignature: Insecure.RSA.Signature = try privateKey.signature(for: message)
+        XCTAssertEqual(type(of: legacySignature).signaturePrefix, "ssh-rsa")
+        XCTAssertTrue(publicKey.isValidSignature(legacySignature, for: message))
+
+        let rsaSHA2Signature = try XCTUnwrap(
+            try privateKey.signature(for: message, algorithm: "rsa-sha2-512") as? Insecure.RSA.SHA512Signature
+        )
+        XCTAssertEqual(type(of: rsaSHA2Signature).signaturePrefix, "rsa-sha2-512")
+        XCTAssertTrue(publicKey.isValidSignature(rsaSHA2Signature, for: message))
         
         let openSSHPrivateKey = try Insecure.RSA.PrivateKey(sshRsa: key)
         XCTAssertNotNil(openSSHPrivateKey)
@@ -123,6 +147,169 @@ final class KeyTests: XCTestCase {
         let key2 = privateKey.makeSSHRepresentation(comment: "jaap@Jaaps-MacBook-Pro.local")
         let privateKey2 = try Curve25519.Signing.PrivateKey(sshEd25519: key2)
         XCTAssertEqual(privateKey.rawRepresentation, privateKey2.rawRepresentation)
+    }
+
+    func testECDSAP256PrivateKey() throws {
+        let privateKey = try P256.Signing.PrivateKey(sshEcdsaP256: Self.ecdsaP256PrivateKey)
+        let message = Data("ecdsa p256 signing test".utf8)
+        let signature = try privateKey.signature(for: message)
+
+        XCTAssertTrue(privateKey.publicKey.isValidSignature(signature, for: message))
+    }
+
+    func testECDSAP256RejectsWrongCurveName() throws {
+        let key = try Self.replacingOpenSSHKeyData(
+            in: Self.ecdsaP256PrivateKey,
+            target: Data("nistp256".utf8),
+            occurrence: 1,
+            replacement: Data("nistp384".utf8)
+        )
+
+        XCTAssertThrowsError(try P256.Signing.PrivateKey(sshEcdsaP256: key))
+    }
+
+    func testECDSAP256RejectsMismatchedOuterPublicKey() throws {
+        let privateKey = try P256.Signing.PrivateKey(sshEcdsaP256: Self.ecdsaP256PrivateKey)
+        let replacementPublicKey = P256.Signing.PrivateKey().publicKey.x963Representation
+        let key = try Self.replacingOpenSSHKeyData(
+            in: Self.ecdsaP256PrivateKey,
+            target: privateKey.publicKey.x963Representation,
+            occurrence: 0,
+            replacement: replacementPublicKey
+        )
+
+        XCTAssertThrowsError(try P256.Signing.PrivateKey(sshEcdsaP256: key))
+    }
+
+    func testECDSAP256RejectsMismatchedPrivatePublicKey() throws {
+        let privateKey = try P256.Signing.PrivateKey(sshEcdsaP256: Self.ecdsaP256PrivateKey)
+        let replacementPublicKey = P256.Signing.PrivateKey().publicKey.x963Representation
+        let key = try Self.replacingOpenSSHKeyData(
+            in: Self.ecdsaP256PrivateKey,
+            target: privateKey.publicKey.x963Representation,
+            occurrence: 1,
+            replacement: replacementPublicKey
+        )
+
+        XCTAssertThrowsError(try P256.Signing.PrivateKey(sshEcdsaP256: key))
+    }
+
+    func testECDSAP256RejectsZeroPrivateScalar() throws {
+        let privateKey = try P256.Signing.PrivateKey(sshEcdsaP256: Self.ecdsaP256PrivateKey)
+        let key = try Self.replacingOpenSSHKeyData(
+            in: Self.ecdsaP256PrivateKey,
+            target: privateKey.rawRepresentation,
+            occurrence: 0,
+            replacement: Data(repeating: 0, count: privateKey.rawRepresentation.count)
+        )
+
+        XCTAssertThrowsError(try P256.Signing.PrivateKey(sshEcdsaP256: key))
+    }
+
+    func testECDSAP256RejectsNegativePrivateScalar() throws {
+        let privateKey = try P256.Signing.PrivateKey(sshEcdsaP256: Self.ecdsaP256PrivateKey)
+        var replacement = privateKey.rawRepresentation
+        replacement[replacement.startIndex] = 0x80
+        let key = try Self.replacingOpenSSHKeyData(
+            in: Self.ecdsaP256PrivateKey,
+            target: privateKey.rawRepresentation,
+            occurrence: 0,
+            replacement: replacement
+        )
+
+        XCTAssertThrowsError(try P256.Signing.PrivateKey(sshEcdsaP256: key))
+    }
+
+    func testECDSAP256RejectsTrailingEnvelopeData() throws {
+        var data = try Self.openSSHPrivateKeyData(Self.ecdsaP256PrivateKey)
+        data.append(0)
+
+        XCTAssertThrowsError(try P256.Signing.PrivateKey(
+            sshEcdsaP256: Self.armoredOpenSSHPrivateKey(data)
+        ))
+    }
+
+    private static let encryptedECDSAP256PrivateKey = """
+        -----BEGIN OPENSSH PRIVATE KEY-----
+        b3BlbnNzaC1rZXktdjEAAAAACmFlczI1Ni1jdHIAAAAGYmNyeXB0AAAAGAAAABDEOKNsY0
+        9vT22aQoHF1o+4AAAAGAAAAAEAAABoAAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlz
+        dHAyNTYAAABBBDJWtGl6Z42uDnOEo4vhJW0JcPlxbOh+HW1uEsMX7UUc6I26AbolQ9gCsZ
+        gQPJVe741Tp7+cdGGi6tItZJNVoXcAAACwYn2kPzSxeAsDfSv7g/ZOZP8LPqFy4oFntNB3
+        a9GFtFfZjXM7JEuoiibbPE5Kdww62MKQleTk/JWh5qpv6dy2ryGgJMmZ9xS4Ol+u/yW/od
+        RMlU9vvh8INl/6qb9b2hDRG7pcxmVEGpUDRhxjbUKTPWZqZlFB5kU/sSRTb5TvfnFvpFu0
+        ekvUlQYENSL0jcQ9/Ebs5O/kbiZWzU9+wrYhW3CCHqLU+tP0jZwU8eB6vcQ=
+        -----END OPENSSH PRIVATE KEY-----
+        """
+
+    func testEncryptedECDSAP256PrivateKey() throws {
+        let privateKey = try P256.Signing.PrivateKey(
+            sshEcdsaP256: Self.encryptedECDSAP256PrivateKey,
+            decryptionKey: Data("passphrase".utf8)
+        )
+        let message = Data("encrypted ecdsa p256 signing test".utf8)
+        let signature = try privateKey.signature(for: message)
+
+        XCTAssertTrue(privateKey.publicKey.isValidSignature(signature, for: message))
+    }
+
+    func testEncryptedECDSAP256RejectsWrongPassphrase() throws {
+        XCTAssertThrowsError(try P256.Signing.PrivateKey(
+            sshEcdsaP256: Self.encryptedECDSAP256PrivateKey,
+            decryptionKey: Data("wrong".utf8)
+        ))
+    }
+
+    func testECDSAP384PrivateKey() throws {
+        let key = """
+        -----BEGIN OPENSSH PRIVATE KEY-----
+        b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAiAAAABNlY2RzYS
+        1zaGEyLW5pc3RwMzg0AAAACG5pc3RwMzg0AAAAYQTbanVgBsim5t0MwvPHpmbupOibZFVU
+        a9Teahi4S4YZsvEob0eX9wYSEA2VF6MNKCDM0wQFtm0tk/5vgG0vqSaqjefgXCsov7mFDx
+        BW0Trg0YqULpUlRR9l9f12TyZm050AAADY3IaN69yGjesAAAATZWNkc2Etc2hhMi1uaXN0
+        cDM4NAAAAAhuaXN0cDM4NAAAAGEE22p1YAbIpubdDMLzx6Zm7qTom2RVVGvU3moYuEuGGb
+        LxKG9Hl/cGEhANlRejDSggzNMEBbZtLZP+b4BtL6kmqo3n4FwrKL+5hQ8QVtE64NGKlC6V
+        JUUfZfX9dk8mZtOdAAAAMQDtslLX7WTAyAIiTxRVtOl9WXp/GKn9agJIJ0/qOpuRaYGLtk
+        w3LPjfQfpJT1dh9CUAAAALeW91QGV4YW1wbGUBAgME
+        -----END OPENSSH PRIVATE KEY-----
+        """
+
+        let privateKey = try P384.Signing.PrivateKey(sshEcdsaP384: key)
+        let message = Data("ecdsa p384 signing test".utf8)
+        let signature = try privateKey.signature(for: message)
+
+        XCTAssertTrue(privateKey.publicKey.isValidSignature(signature, for: message))
+    }
+
+    func testECDSAP521PrivateKey() throws {
+        let key = """
+        -----BEGIN OPENSSH PRIVATE KEY-----
+        b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAArAAAABNlY2RzYS
+        1zaGEyLW5pc3RwNTIxAAAACG5pc3RwNTIxAAAAhQQAuwrbbKlzQliuu1AmBtr9N7xG1Qic
+        MqizNJa5zWWnm9rvBvQwIl0u6NDmUMVTnLxscnk9hXARGaLnn2ufhGhrDWkBujkMnwfGy7
+        f/eIIOmWwdoMh/fbam5qMtOgNIp5QO9I70QstcHF62ankrtmcgBZtdCBsvHAuIfL6IK2ts
+        BgG7cvMAAAEQktYcEpLWHBIAAAATZWNkc2Etc2hhMi1uaXN0cDUyMQAAAAhuaXN0cDUyMQ
+        AAAIUEALsK22ypc0JYrrtQJgba/Te8RtUInDKoszSWuc1lp5va7wb0MCJdLujQ5lDFU5y8
+        bHJ5PYVwERmi559rn4Roaw1pAbo5DJ8Hxsu3/3iCDplsHaDIf322puajLToDSKeUDvSO9E
+        LLXBxetmp5K7ZnIAWbXQgbLxwLiHy+iCtrbAYBu3LzAAAAQgETL+ZErb1c9FwcOKtIuXgy
+        pS4OdBd4Il5mUSzCwJ/PKWO0L+KRTthlNrwZTRxrdGIsjonmEEoIh9kLfGM3Tpa0YQAAAA
+        t5b3VAZXhhbXBsZQECAwQFBgc=
+        -----END OPENSSH PRIVATE KEY-----
+        """
+
+        let privateKey = try P521.Signing.PrivateKey(sshEcdsaP521: key)
+        let message = Data("ecdsa p521 signing test".utf8)
+        let signature = try privateKey.signature(for: message)
+
+        XCTAssertTrue(privateKey.publicKey.isValidSignature(signature, for: message))
+    }
+
+    func testGeneratedED25519PrivateKeyWithFullBlockPadding() throws {
+        let privateKey = Curve25519.Signing.PrivateKey()
+        let key = privateKey.makeSSHRepresentation(comment: "12345")
+
+        let parsed = try Curve25519.Signing.PrivateKey(sshEd25519: key)
+
+        XCTAssertEqual(privateKey.rawRepresentation, parsed.rawRepresentation)
     }
     
     func testSSHKeyTypeDetection() throws {
@@ -328,5 +515,67 @@ final class KeyTests: XCTestCase {
         """
         let ecdsa521KeyType = try SSHKeyDetection.detectPrivateKeyType(from: ecdsa521PrivateKey)
         XCTAssertEqual(ecdsa521KeyType, .ecdsaP521)
+    }
+
+    private enum KeyFixtureError: Error {
+        case invalidArmor
+        case missingTarget
+    }
+
+    private static func replacingOpenSSHKeyData(
+        in key: String,
+        target: Data,
+        occurrence: Int,
+        replacement: Data
+    ) throws -> String {
+        precondition(target.count == replacement.count)
+
+        var data = try openSSHPrivateKeyData(key)
+
+        var searchRange = data.startIndex..<data.endIndex
+        var foundRange: Range<Data.Index>?
+        for _ in 0...occurrence {
+            guard let range = data.range(of: target, options: [], in: searchRange) else {
+                throw KeyFixtureError.missingTarget
+            }
+            foundRange = range
+            searchRange = range.upperBound..<data.endIndex
+        }
+
+        guard let range = foundRange else {
+            throw KeyFixtureError.missingTarget
+        }
+
+        data.replaceSubrange(range, with: replacement)
+        return armoredOpenSSHPrivateKey(data)
+    }
+
+    private static func openSSHPrivateKeyData(_ key: String) throws -> Data {
+        let base64 = key
+            .split(separator: "\n")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.hasPrefix("-----") && !$0.isEmpty }
+            .joined()
+
+        guard let data = Data(base64Encoded: base64) else {
+            throw KeyFixtureError.invalidArmor
+        }
+
+        return data
+    }
+
+    private static func armoredOpenSSHPrivateKey(_ data: Data) -> String {
+        let base64 = data.base64EncodedString()
+        let lines = stride(from: 0, to: base64.count, by: 70).map { offset in
+            let startIndex = base64.index(base64.startIndex, offsetBy: offset)
+            let endIndex = base64.index(startIndex, offsetBy: min(70, base64.distance(from: startIndex, to: base64.endIndex)))
+            return String(base64[startIndex..<endIndex])
+        }
+
+        return """
+        -----BEGIN OPENSSH PRIVATE KEY-----
+        \(lines.joined(separator: "\n"))
+        -----END OPENSSH PRIVATE KEY-----
+        """
     }
 }

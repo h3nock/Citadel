@@ -72,6 +72,103 @@ public final class SFTPClient: Sendable {
     public var eventLoop: EventLoop {
         self.channel.eventLoop
     }
+
+    /// Open an SFTP subchannel over an already-authenticated SSH channel.
+    ///
+    /// The channel must have a configured `NIOSSHHandler`; this method creates
+    /// only the SFTP child channel and does not own or close the SSH channel.
+    public static func open(
+        overAuthenticatedSSHChannel channel: Channel,
+        logger: Logger = .init(label: "nl.orlandos.citadel.sftp")
+    ) async throws -> SFTPClient {
+        try await channel.eventLoop.flatSubmit {
+            channel.pipeline.handler(type: NIOSSHHandler.self).flatMap { sshHandler in
+                open(
+                    over: sshHandler,
+                    eventLoop: channel.eventLoop,
+                    logger: logger
+                )
+            }
+        }.get()
+    }
+
+    fileprivate static func open(
+        over sshHandler: NIOSSHHandler,
+        eventLoop: EventLoop,
+        logger: Logger
+    ) -> EventLoopFuture<SFTPClient> {
+        let result = eventLoop.makePromise(of: SFTPClient.self)
+        let createChannel = eventLoop.makePromise(of: Channel.self)
+        let createClient = eventLoop.makePromise(of: SFTPClient.self)
+        let openTimeout: TimeAmount = .seconds(15)
+
+        sshHandler.createChannel(createChannel) { channel, _ in
+            result.futureResult.whenFailure { _ in
+                channel.close(promise: nil)
+            }
+            return SFTPClient.setupChannelHanders(channel: channel, logger: logger)
+                .map { client in
+                    createClient.succeed(client)
+                }
+        }
+
+        let timeout = eventLoop.scheduleTask(in: openTimeout) {
+            logger.warning("SFTP subsystem request or initialize message received no reply after 15 seconds. Likely the result of opening too many SFTPClient handles.")
+            createChannel.fail(SFTPError.missingResponse)
+            createClient.fail(SFTPError.missingResponse)
+            result.fail(SFTPError.missingResponse)
+        }
+
+        let open = createChannel.futureResult.flatMap { channel in
+            let openSubsystem = eventLoop.makePromise(of: Void.self)
+
+            logger.debug("SFTP requesting subsystem")
+
+            channel.triggerUserOutboundEvent(
+                SSHChannelRequestEvent.SubsystemRequest(
+                    subsystem: "sftp",
+                    wantReply: true
+                ),
+                promise: openSubsystem
+            )
+
+            let initialized = openSubsystem.futureResult.flatMap {
+                logger.debug("SFTP subsystem request completed")
+                return createClient.futureResult
+            }.flatMap { (client: SFTPClient) in
+                let initializeMessage = SFTPMessage.initialize(.init(version: .v3))
+
+                logger.debug("SFTP start with version \(SFTPProtocolVersion.v3)")
+                logger.trace("SFTP OUT: \(initializeMessage.debugDescription)")
+                //logger.trace("SFTP OUT: \(initializeMessage.debugRawBytesRepresentation)")
+
+                return client.channel.writeAndFlush(initializeMessage).flatMap {
+                    return client.responses.sftpVersion.futureResult
+                }.flatMapThrowing { serverVersion in
+                    guard serverVersion.version >= .v3 else {
+                        logger.warning("SFTP ERROR: Server version is unrecognized: \(serverVersion.version.rawValue)")
+                        throw SFTPError.unsupportedVersion(serverVersion.version)
+                    }
+
+                    logger.info("SFTP connection opened and ready")
+                    return client
+                }
+            }
+
+            return initialized.flatMapError { error in
+                channel.close().flatMapThrowing {
+                    throw error
+                }
+            }
+        }
+
+        open.whenComplete { openResult in
+            timeout.cancel()
+            result.completeWith(openResult)
+        }
+
+        return result.futureResult
+    }
     
     /// Returns a unique request ID for use in an SFTP message. Does _not_ register the ID for
     /// a response; that is handled by `sendRequest(_:)`.
@@ -85,23 +182,33 @@ public final class SFTPClient: Sendable {
     ///   ID is in flight at any given time; multiple reponses to the same ID are likely to cause
     ///   unpredictable behavior.
     internal func sendRequest(_ request: SFTPRequest) async throws -> SFTPResponse {
-        try await self.eventLoop.flatSubmit {
+        try await self.sendRequestFuture(request).get()
+    }
+
+    internal func sendRequestFuture(_ request: SFTPRequest) -> EventLoopFuture<SFTPResponse> {
+        self.eventLoop.flatSubmit {
             let requestId = request.requestId
             let promise = self.channel.eventLoop.makePromise(of: SFTPResponse.self)
-            
+
             // In release builds, silently accept overlapping request IDs, since it can accidentally work correctly.
             assert(self.responses.responses[requestId] == nil, "Attempt to send request with request ID \(requestId) already in flight.")
 
             let message = request.makeMessage()
-            
+
             self.logger.trace("SFTP OUT: \(message.debugDescription)")
             //logger.trace("SFTP OUT: \(message.debugRawBytesRepresentation)")
 
-            self.responses.responses[requestId] = promise
-            return self.channel.writeAndFlush(request.makeMessage()).flatMap {
+            self.responses.register(promise, forRequestId: requestId)
+
+            let writeFuture = self.channel.writeAndFlush(message)
+            writeFuture.whenFailure { error in
+                self.responses.removeResponse(forRequestId: requestId)?.fail(error)
+            }
+
+            return writeFuture.flatMap {
                 promise.futureResult
             }
-        }.get()
+        }
     }
 
     /// Set the attributes of a file on the SFTP server.
@@ -517,64 +624,11 @@ extension SSHClient {
         logger: Logger = .init(label: "nl.orlandos.citadel.sftp")
     ) async throws -> SFTPClient {
         try await eventLoop.flatSubmit { [eventLoop, sshHandler = session.sshHandler] in
-            let createChannel = eventLoop.makePromise(of: Channel.self)
-            let createClient = eventLoop.makePromise(of: SFTPClient.self)
-            let timeoutCheck = eventLoop.makePromise(of: Void.self)
-            
-            sshHandler.value.createChannel(createChannel) { channel, _ in
-                SFTPClient.setupChannelHanders(channel: channel, logger: logger)
-                    .map { client in
-                        createClient.succeed(client)
-                    }
-            }
-            
-            timeoutCheck.futureResult.whenFailure { _ in
-                logger.warning("SFTP subsystem request or initialize message received no reply after 15 seconds. Likely the result of opening too many SFTPClient handles.")
-            }
-            
-            eventLoop.scheduleTask(in: .seconds(15)) {
-                timeoutCheck.fail(SFTPError.missingResponse)
-                createChannel.fail(SFTPError.missingResponse)
-                createClient.fail(SFTPError.missingResponse)
-            }
-            
-            return createChannel.futureResult.flatMap { channel in
-                let openSubsystem = eventLoop.makePromise(of: Void.self)
-
-                logger.debug("SFTP requesting subsystem")
-
-                channel.triggerUserOutboundEvent(
-                    SSHChannelRequestEvent.SubsystemRequest(
-                        subsystem: "sftp",
-                        wantReply: true
-                    ),
-                    promise: openSubsystem
-                )
-                return openSubsystem.futureResult
-            }.flatMap {
-                logger.debug("SFTP subsystem request completed")
-                return createClient.futureResult
-            }.flatMap { (client: SFTPClient) in
-                timeoutCheck.succeed(())
-                
-                let initializeMessage = SFTPMessage.initialize(.init(version: .v3))
-                
-                logger.debug("SFTP start with version \(SFTPProtocolVersion.v3)")
-                logger.trace("SFTP OUT: \(initializeMessage.debugDescription)")
-                //logger.trace("SFTP OUT: \(initializeMessage.debugRawBytesRepresentation)")
-
-                return client.channel.writeAndFlush(initializeMessage).flatMap {
-                    return client.responses.sftpVersion.futureResult
-                }.flatMapThrowing { serverVersion in
-                    guard serverVersion.version >= .v3 else {
-                        logger.warning("SFTP ERROR: Server version is unrecognized: \(serverVersion.version.rawValue)")
-                        throw SFTPError.unsupportedVersion(serverVersion.version)
-                    }
-                    
-                    logger.info("SFTP connection opened and ready")
-                    return client
-                }
-            }
+            SFTPClient.open(
+                over: sshHandler.value,
+                eventLoop: eventLoop,
+                logger: logger
+            )
         }.get()
     }
 }
@@ -591,6 +645,18 @@ final class SFTPResponses: Sendable {
     var responses: [UInt32: EventLoopPromise<SFTPResponse>] {
         get { _responses.withLockedValue { $0 } }
         set { _responses.withLockedValue { $0 = newValue } }
+    }
+
+    func register(_ promise: EventLoopPromise<SFTPResponse>, forRequestId requestId: UInt32) {
+        _responses.withLockedValue { responses in
+            responses[requestId] = promise
+        }
+    }
+
+    func removeResponse(forRequestId requestId: UInt32) -> EventLoopPromise<SFTPResponse>? {
+        _responses.withLockedValue { responses in
+            responses.removeValue(forKey: requestId)
+        }
     }
     
     init(sftpVersion: EventLoopPromise<SFTPMessage.Version>) {
