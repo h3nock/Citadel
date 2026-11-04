@@ -130,7 +130,6 @@ final class SFTPMessageSerializer: MessageToByteEncoder {
             out.writeInteger(rename.requestId)
             out.writeSSHString(rename.oldPath)
             out.writeSSHString(rename.newPath)
-            out.writeInteger(rename.flags)
         }
         
         let length = out.writerIndex - lengthIndex - 4

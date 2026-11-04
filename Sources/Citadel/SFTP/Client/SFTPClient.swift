@@ -506,8 +506,8 @@ public final class SFTPClient: Sendable {
     /// - Parameters:
     ///   - oldPath: Current path of the file
     ///   - newPath: Desired new path
-    ///   - flags: Optional flags affecting the rename operation
-    /// - Throws: SFTPError if rename fails
+    ///   - flags: Reserved for source compatibility. Must be zero; SFTP v3 has no rename flags.
+    /// - Throws: CitadelError.unsupported for nonzero flags, or SFTPError if rename fails.
     ///
     /// ## Example
     /// ```swift
@@ -521,6 +521,12 @@ public final class SFTPClient: Sendable {
         to newPath: String,
         flags: UInt32 = 0
     ) async throws {
+        // SFTP v3 has no rename flags. Keep the argument for source compatibility,
+        // but reject unsupported semantics before sending anything to the peer.
+        guard flags == 0 else {
+            throw CitadelError.unsupported
+        }
+
         self.logger.info("SFTP requesting rename file at '\(oldPath)' to '\(newPath)'")
 
         let _ = try await sendRequest(.rename(.init(
