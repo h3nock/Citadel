@@ -379,7 +379,7 @@ struct SFTPMessageParser: ByteToMessageDecoder {
                 let requestId = payload.readInteger(as: UInt32.self),
                 let oldPath = payload.readSSHString(),
                 let newPath = payload.readSSHString(),
-                let flags = payload.readInteger(as: UInt32.self)
+                payload.readableBytes == 0
             else {
                 throw SFTPError.invalidPayload(type: type)
             }
@@ -389,7 +389,7 @@ struct SFTPMessageParser: ByteToMessageDecoder {
                     requestId: requestId,
                     oldPath: oldPath,
                     newPath: newPath,
-                    flags: flags
+                    flags: 0
                 )
             )
 
